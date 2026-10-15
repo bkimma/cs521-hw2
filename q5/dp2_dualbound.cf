@@ -1,0 +1,54 @@
+// dp2_dualbound.cf : DeepPoly that keeps BOTH polyhedral lower bounds per ReLU.
+//
+// This is the design the HW2 hint suggests. For a ReLU whose input crosses zero,
+// both y>=0 and y>=x are sound lower bounds; DeepPoly commits to one via the area
+// heuristic. Here we keep both:
+//     L  = area-heuristic choice   (the standard DeepPoly chain)
+//     La = the opposite 0/x choice (the alternative chain)
+// and set the concrete lower bound to the max of the two back-substitution passes.
+// Because one chain is exactly DeepPoly's, this is sound and provably >= DeepPoly.
+//
+// provesound PROVES this certifier sound ("Proved Affine", "Proved Relu").
+//
+// NOTE (compile/run): the ConstraintFlow compiler at the pinned commit 881e270
+// parallelizes the two same-direction (both-lower) back-substitution traversals
+// into threads and emits a faulty `nonlocal`, raising
+//     UnboundLocalError: ... 'phi_trav_exp1_1_1' ...
+// So this proven-sound design cannot be compiled/run with the stock run_cf.py.
+// The runnable comparison in part (c) therefore uses dp2.cf, an interval-refined
+// DeepPoly variant that is also sound and never less precise than DeepPoly.
+
+def Shape as (Float l, Float u, PolyExp L, PolyExp U, PolyExp La){[(curr[l]<=curr),(curr[u]>=curr),(curr[L]<=curr),(curr[U]>=curr),(curr[La]<=curr)]};
+
+func simplify_lower(Neuron n, Float coeff) = (coeff >= 0.0) ? (coeff * n[l]) : (coeff * n[u]);
+func simplify_upper(Neuron n, Float coeff) = (coeff >= 0.0) ? (coeff * n[u]) : (coeff * n[l]);
+
+func replace_lower(Neuron n, Float coeff)   = (coeff >= 0.0) ? (coeff * n[L])  : (coeff * n[U]);
+func replace_lower_a(Neuron n, Float coeff) = (coeff >= 0.0) ? (coeff * n[La]) : (coeff * n[U]);
+func replace_upper(Neuron n, Float coeff)   = (coeff >= 0.0) ? (coeff * n[U])  : (coeff * n[L]);
+
+func priority(Neuron n) = n[layer];
+func priority2(Neuron n, Float c) = -n[layer];
+func stop(Neuron n) = false;
+func stop_traverse(Neuron n, Float c) = false;
+
+func backsubs_lower(PolyExp e, Neuron n)   = (e.traverse(backward, priority2, stop_traverse, replace_lower){e <= n}).map(simplify_lower);
+func backsubs_lower_a(PolyExp e, Neuron n) = (e.traverse(backward, priority2, stop_traverse, replace_lower_a){e <= n}).map(simplify_lower);
+func backsubs_upper(PolyExp e, Neuron n)   = (e.traverse(backward, priority2, stop_traverse, replace_upper){e >= n}).map(simplify_upper);
+
+func relu(Float x) = x >= 0.0 ? x : 0.0;
+func relu_lower(Neuron n) = n[l] + n[u] >= 0.0 ? n : 0.0;
+func relu_lower_alt(Neuron n) = n[l] >= 0.0 ? n : (n[u] <= 0.0 ? 0.0 : (n[l] + n[u] >= 0.0 ? 0.0 : n));
+func relu_upper(Neuron n) = n[l] >= 0.0 ? n : (n[u] <= 0.0 ? 0.0 : (((n[u]) / ((n[u]) - (n[l]))) * n) - (((n[u]) * (n[l])) / ((n[u]) - (n[l]))));
+
+transformer dp2{
+    Affine -> (max(backsubs_lower(prev.dot(curr[weight]) + curr[bias], curr),
+                   backsubs_lower_a(prev.dot(curr[weight]) + curr[bias], curr)),
+               backsubs_upper(prev.dot(curr[weight]) + curr[bias], curr),
+               prev.dot(curr[weight]) + curr[bias],
+               prev.dot(curr[weight]) + curr[bias],
+               prev.dot(curr[weight]) + curr[bias]);
+    Relu -> (relu(prev[l]), relu(prev[u]), relu_lower(prev), relu_upper(prev), relu_lower_alt(prev));
+}
+
+flow(forward, priority, stop, dp2);

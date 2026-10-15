@@ -1,0 +1,58 @@
+// hardtanh.cf : a DeepPoly transformer for HardTanh(x) = max(-1, min(1, x)).
+//
+// HardTanh is piecewise linear with knees at x=-1 and x=1, and is monotone
+// increasing, so the concrete bounds are l=HardTanh(prev[l]), u=HardTanh(prev[u]).
+// The polyhedral bounds L,U are sound linear bounds over [prev[l], prev[u]]:
+//
+//   * flat-low  (pu <= -1)            : HardTanh == -1              -> (-1,-1,-1,-1)
+//   * flat-high (pl >=  1)            : HardTanh ==  1              -> ( 1, 1, 1, 1)
+//   * linear    (pl>=-1 and pu<=1)    : HardTanh == x              -> (pl,pu, x, x)
+//   * upper knee(pl>=-1 and pu> 1)    : concave min(1,x) on [pl,pu]
+//         lower L = secant (pl,pl)->(pu,1)   (secant is below a concave fn)
+//         upper U = x                        (min(1,x) <= x)
+//   * lower knee(pl< -1 and pu<=1)    : convex  max(-1,x) on [pl,pu]
+//         lower L = x                        (max(-1,x) >= x)
+//         upper U = secant (pl,-1)->(pu,pu)  (secant is above a convex fn)
+//   * both knees(pl< -1 and pu> 1)    : clamp, neither convex nor concave
+//         box bounds  L=-1, U=1              (sound; HardTanh in [-1,1])
+
+def Shape as (Float l, Float u, PolyExp L, PolyExp U){[(curr[l]<=curr),(curr[u]>=curr),(curr[L]<=curr),(curr[U]>=curr)]};
+
+func simplify_lower(Neuron n, Float coeff) = (coeff >= 0.0) ? (coeff * n[l]) : (coeff * n[u]);
+func simplify_upper(Neuron n, Float coeff) = (coeff >= 0.0) ? (coeff * n[u]) : (coeff * n[l]);
+
+func replace_lower(Neuron n, Float coeff) = (coeff >= 0.0) ? (coeff * n[L]) : (coeff * n[U]);
+func replace_upper(Neuron n, Float coeff) = (coeff >= 0.0) ? (coeff * n[U]) : (coeff * n[L]);
+
+func priority(Neuron n) = n[layer];
+func priority2(Neuron n, Float c) = -n[layer];
+func stop(Neuron n) = false;
+func stop_traverse(Neuron n, Float c) = false;
+
+func backsubs_lower(PolyExp e, Neuron n) = (e.traverse(backward, priority2, stop_traverse, replace_lower){e <= n}).map(simplify_lower);
+func backsubs_upper(PolyExp e, Neuron n) = (e.traverse(backward, priority2, stop_traverse, replace_upper){e >= n}).map(simplify_upper);
+
+// secant of the concave branch min(1,x) through (prev[l],prev[l]) and (prev[u],1): a lower bound.
+func ht_lower_secant(Neuron n) = (((1 - n[l]) / (n[u] - n[l])) * n) + (n[l] * (1 - ((1 - n[l]) / (n[u] - n[l]))));
+// secant of the convex branch max(-1,x) through (prev[l],-1) and (prev[u],prev[u]): an upper bound.
+func ht_upper_secant(Neuron n) = (((n[u] + 1) / (n[u] - n[l])) * n) - (1 + (((n[u] + 1) / (n[u] - n[l])) * n[l]));
+
+transformer deeppoly{
+    Affine -> (backsubs_lower(prev.dot(curr[weight]) + curr[bias], curr),
+               backsubs_upper(prev.dot(curr[weight]) + curr[bias], curr),
+               prev.dot(curr[weight]) + curr[bias],
+               prev.dot(curr[weight]) + curr[bias]);
+    HardTanh -> (prev[u] <= -1) ?
+                    (-1, -1, -1, -1) :
+                ((prev[l] >= 1) ?
+                    (1, 1, 1, 1) :
+                ((prev[l] >= -1) ?
+                    ((prev[u] <= 1) ?
+                        (prev[l], prev[u], prev, prev) :
+                        (prev[l], 1, ht_lower_secant(prev), prev)) :
+                    ((prev[u] <= 1) ?
+                        (-1, prev[u], prev, ht_upper_secant(prev)) :
+                        (-1, 1, -1, 1))));
+}
+
+flow(forward, priority, stop, deeppoly);
